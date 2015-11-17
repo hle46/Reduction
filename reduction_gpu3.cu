@@ -17,14 +17,14 @@
 
 using namespace std;
 
-__global__ void getMin(float *input, int len, float *output_val,
+__global__ void getMin(float *input, int *input_idx, int offset, int len, int offset_out, float *output_val,
                        int *output_idx) {
   __shared__ float smem_val[BLOCK_SIZE];
   __shared__ int smem_idx[BLOCK_SIZE];
 
   int tx = threadIdx.x;
 
-  int i = tx + blockIdx.x * BLOCK_SIZE * 8;
+  int i = tx + blockIdx.x * BLOCK_SIZE * 8 + offset;
 
   float min_val = INFINITY;
   int min_idx = i;
@@ -131,8 +131,8 @@ __global__ void getMin(float *input, int len, float *output_val,
   }
 
   if (tx == 0) {
-    output_val[blockIdx.x] = min_val;
-    output_idx[blockIdx.x] = min_idx;
+    output_val[blockIdx.x + offset_out] = min_val;
+    output_idx[blockIdx.x + offset_out] = (input_idx == nullptr) ? min_idx : input_idx[min_idx];
   }
 }
 
@@ -153,52 +153,75 @@ int main(int argc, char *argv[]) {
   for (int i = 0; i < len; ++i) {
     h_a[i] = rand() / (float)RAND_MAX;
   }
-  cout << "Elapsed time: " << double(clock() - begin) / CLOCKS_PER_SEC * 1000
+  cout << "Create dataset elapsed time: " << double(clock() - begin) / CLOCKS_PER_SEC * 1000
        << " ms\n";
 
-  begin = clock();
-  int len_out = ceil((float)len / (BLOCK_SIZE * 8));
-  float *h_val = (float *)malloc(sizeof(float) * len_out);
-  int *h_idx = (int *)malloc(sizeof(int) * len_out);
+  const int n_streams = 4;
+  cudaStream_t streams[n_streams];
+  const int stream_size = ceil((float)len / (8 * BLOCK_SIZE * n_streams)) * (8 * BLOCK_SIZE);
+  cout << "Stream size: " << stream_size << "\n";
+  for (int i = 0; i < n_streams; ++i) {
+    CHECK(cudaStreamCreate(&streams[i]))
+  }
+
+  int len_out = ceil((float)stream_size / (BLOCK_SIZE * 8)) * n_streams;
+  int len_out1 = ceil((float)len_out / (BLOCK_SIZE * 8));
+  float *h_val = (float *)malloc(sizeof(float) * len_out1);
+  int *h_idx = (int *)malloc(sizeof(int) * len_out1);
 
   float *d_a;
-  float *d_val;
-  int *d_idx;
-
+  float *d_val, *d_val1;
+  int *d_idx, *d_idx1;
 
   CHECK(cudaMalloc((void **)&d_a, sizeof(float) * len));
   CHECK(cudaMalloc((void **)&d_val, sizeof(float) * len_out));
   CHECK(cudaMalloc((void **)&d_idx, sizeof(int) * len_out));
+  CHECK(cudaMalloc((void **)&d_val1, sizeof(float) * len_out1));
+  CHECK(cudaMalloc((void **)&d_idx1, sizeof(int) * len_out1));
 
   CHECK(cudaMemcpy(d_a, h_a, sizeof(float) * len, cudaMemcpyHostToDevice));
 
-  getMin<<<len_out, BLOCK_SIZE>>>(d_a, len, d_val, d_idx);
-
-  CHECK(cudaMemcpy(h_val, d_val, sizeof(float) * len_out,
-                   cudaMemcpyDeviceToHost));
-  CHECK(cudaMemcpy(h_idx, d_idx, sizeof(int) * len_out,
-                   cudaMemcpyDeviceToHost));
+  for (int i = 0; i < n_streams; ++i) {
+    int offset = i * stream_size;
+    int offset_out = i * (float)stream_size/(BLOCK_SIZE * 8);
+    getMin<<<ceil((float)stream_size/(BLOCK_SIZE * 8)), BLOCK_SIZE, 0, streams[i]>>>(d_a, nullptr, offset, len, offset_out, d_val, d_idx);
+  }
 
   CHECK(cudaDeviceSynchronize());
 
+  getMin<<<len_out1, BLOCK_SIZE>>>(d_val, d_idx, 0, len_out, 0, d_val1, d_idx1);
+
+  CHECK(cudaDeviceSynchronize());
+
+  CHECK(cudaMemcpy(h_val, d_val1, sizeof(float) * len_out1,
+                   cudaMemcpyDeviceToHost));
+  CHECK(cudaMemcpy(h_idx, d_idx1, sizeof(int) * len_out1,
+                   cudaMemcpyDeviceToHost));
+
+
+
   float val = h_val[0];
   int idx = h_idx[0];
-  for (int i = 0; i < len_out; ++i) {
+  for (int i = 0; i < len_out1; ++i) {
     if (h_val[i] < val) {
       val = h_val[i];
       idx = h_idx[i];
     }
   }
-  cout << "Elapsed time: " << double(clock() - begin) / CLOCKS_PER_SEC * 1000
-       << " ms\n";
 
   cout << "Number of elements: " << len << ", min val: " << val
        << ", min idx: " << idx << "\n";
+
+  for (int i = 0; i < n_streams; ++i) {
+    CHECK(cudaStreamDestroy(streams[i]));
+  }
 
   // Free device
   CHECK(cudaFree(d_a));
   CHECK(cudaFree(d_val));
   CHECK(cudaFree(d_idx));
+  CHECK(cudaFree(d_val1));
+  CHECK(cudaFree(d_idx1));
 
   // Free host
   free(h_a);
